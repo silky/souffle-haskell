@@ -6,6 +6,10 @@ module Main ( main ) where
 -- this repository. This is done in order to make Haskell libraries that
 -- use souffle-haskell "self-contained", meaning users of the packages
 -- using those libraries are not required to have souffle (headers) installed.
+--
+-- Currently the script assumes that all headers have a unique name, simplifying
+-- the algorithm significantly. If this changes in the future, changes to the
+-- algorithm will need to be made.
 
 import System.Directory
 import System.FilePath
@@ -35,6 +39,11 @@ newtype TopLevelInclude = TopLevelInclude FilePath
 newtype RequiredInclude = RequiredInclude FilePath
   deriving (Eq, Show, Generic, Souffle.Marshal, FactMetadata)
 
+type FileName = String
+
+data BaseName = BaseName FileName FilePath
+  deriving (Eq, Show, Generic, Souffle.Marshal, FactMetadata)
+
 data Handle = Handle
 
 instance Souffle.Program Handle where
@@ -43,6 +52,7 @@ instance Souffle.Program Handle where
     , Includes
     , TransitivelyIncludes
     , RequiredInclude
+    , BaseName
     ]
   programName = const "required_include"
 
@@ -62,29 +72,44 @@ instance Souffle.Fact RequiredInclude where
   type FactDirection RequiredInclude = 'Souffle.Output
   factName = const "required_include"
 
+instance Souffle.Fact BaseName where
+  type FactDirection BaseName = 'Souffle.Input
+  factName = const "basename"
+
 dlProgram :: DSL Handle 'Definition ()
 dlProgram = do
-  Predicate includes <- predicateFor @Includes
-  Predicate transitivelyIncludes <- predicateFor @TransitivelyIncludes
+  pIncludes <- predicateFor @Includes
+  pTransitivelyIncludes@(Predicate transitivelyIncludes) <- predicateFor @TransitivelyIncludes
   Predicate topLevelInclude <- predicateFor @TopLevelInclude
   Predicate requiredInclude <- predicateFor @RequiredInclude
+  Predicate baseName <- predicateFor @BaseName
 
+  file <- var "file"
   file1 <- var "file1"
   file2 <- var "file2"
-  file3 <- var "file3"
+  path <- var "path"
 
-  requiredInclude(file1) |-
+  requiredInclude(path) |- do
+    topLevelInclude(file)
+    baseName(file, path)
+
+  requiredInclude(path) |- do
     topLevelInclude(file1)
-  requiredInclude(file1) |- do
-    topLevelInclude(file2)
-    transitivelyIncludes(file2, file1)
+    transitivelyIncludes(file1, file2)
+    baseName(file2, path)
 
-  transitivelyIncludes(file1, file2) |-
-    includes(file1, file2)
-  transitivelyIncludes(file1, file2) |- do
-    includes(file1, file3)
-    transitivelyIncludes(file3, file2)
+  pTransitivelyIncludes `transitiveVia` pIncludes
 
+ where
+   transitiveVia (Predicate p1) (Predicate p2) = do
+     a <- var "a"
+     b <- var "b"
+     c <- var "c"
+
+     p1(a, b) |- p2(a, b)
+     p1(a, b) |- do
+       p2(a, c)
+       p1(c, b)
 
 run :: String -> IO ()
 run = callCommand
@@ -132,34 +157,26 @@ parseIncludes s = either (const []) catMaybes $ P.runParser parser "" s where
 
 parseIncludesInHeader :: FilePath -> IO [Includes]
 parseIncludesInHeader file = f <$> readFile file where
-  f = map ((file `Includes`) . normalizeFilePath dir) . parseIncludes
-  dir = takeDirectory file
-
-normalizeFilePath :: FilePath -> FilePath -> FilePath
-normalizeFilePath dir file = normalize $ dir </> file' where
-  file' = if "souffle/" `isPrefixOf` file then file \\ "souffle/" else file
-  normalize = withExplodedPath (reverse . removeParentDirRefs . reverse)
-  removeParentDirRefs = \case
-    ("../":_:xs) -> removeParentDirRefs xs
-    (x:xs) -> x:removeParentDirRefs xs
-    [] -> []
+  file' = takeFileName file
+  f = map ((Includes file') . takeFileName) . parseIncludes
 
 copyHeaders :: IO [FilePath]
 copyHeaders = do
   headers <- filter (".h" `isSuffixOf`) . lines
           <$> runWithResult "find souffle -type f"
   includes <- concatMapM parseIncludesInHeader headers
-  traverse copyHeader =<< computeRequiredIncludes includes
+  let baseNames = map toBaseName headers
+  traverse copyHeader =<< computeRequiredIncludes includes baseNames
+  where toBaseName path = BaseName (takeFileName path) path
 
-computeRequiredIncludes :: [Includes] -> IO [FilePath]
-computeRequiredIncludes includes = do
+computeRequiredIncludes :: [Includes] -> [BaseName] -> IO [FilePath]
+computeRequiredIncludes includes baseNames = do
   requiredIncludes <- runSouffleInterpreted Handle dlProgram $ \case
     Nothing -> error "Failed to load Souffle program. Aborting."
     Just prog -> do
-      Souffle.addFacts prog [ TopLevelInclude "souffle/src/SouffleInterface.h"
-                            , TopLevelInclude "souffle/src/CompiledSouffle.h"
-                            ]
+      Souffle.addFact prog $ TopLevelInclude "CompiledSouffle.h"
       Souffle.addFacts prog includes
+      Souffle.addFacts prog baseNames
       Souffle.run prog
       Souffle.getFacts prog
   pure $ map (\(RequiredInclude include) -> include) requiredIncludes
@@ -168,7 +185,7 @@ copyHeader :: FilePath -> IO FilePath
 copyHeader file = do
   header <- head . filter (file `isSuffixOf`) . lines
         <$> runWithResult "find souffle/ -type f"
-  let header' = withExplodedPath (drop 2) header
+  let header' = withExplodedPath (drop 4) header
       dir = headerDir </> takeDirectory header'
       destination = replaceDirectory header' dir
   createDirectoryIfMissing True dir

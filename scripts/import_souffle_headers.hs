@@ -19,6 +19,8 @@ import Control.Monad.Extra
 import Control.Applicative
 import Data.List
 import Data.Maybe
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Void
 import GHC.Generics
 import qualified Text.Megaparsec as P
@@ -41,9 +43,6 @@ newtype RequiredInclude = RequiredInclude FilePath
 
 type FileName = String
 
-data BaseName = BaseName FileName FilePath
-  deriving (Eq, Show, Generic, Souffle.Marshal, FactMetadata)
-
 data Handle = Handle
 
 instance Souffle.Program Handle where
@@ -52,7 +51,6 @@ instance Souffle.Program Handle where
     , Includes
     , TransitivelyIncludes
     , RequiredInclude
-    , BaseName
     ]
   programName = const "required_include"
 
@@ -72,31 +70,23 @@ instance Souffle.Fact RequiredInclude where
   type FactDirection RequiredInclude = 'Souffle.Output
   factName = const "required_include"
 
-instance Souffle.Fact BaseName where
-  type FactDirection BaseName = 'Souffle.Input
-  factName = const "basename"
-
 dlProgram :: DSL Handle 'Definition ()
 dlProgram = do
   pIncludes <- predicateFor @Includes
   pTransitivelyIncludes@(Predicate transitivelyIncludes) <- predicateFor @TransitivelyIncludes
   Predicate topLevelInclude <- predicateFor @TopLevelInclude
   Predicate requiredInclude <- predicateFor @RequiredInclude
-  Predicate baseName <- predicateFor @BaseName
 
   file <- var "file"
   file1 <- var "file1"
   file2 <- var "file2"
-  path <- var "path"
 
-  requiredInclude(path) |- do
+  requiredInclude(file) |-
     topLevelInclude(file)
-    baseName(file, path)
 
-  requiredInclude(path) |- do
-    topLevelInclude(file1)
-    transitivelyIncludes(file1, file2)
-    baseName(file2, path)
+  requiredInclude(file1) |- do
+    topLevelInclude(file2)
+    transitivelyIncludes(file2, file1)
 
   pTransitivelyIncludes `transitiveVia` pIncludes
 
@@ -165,21 +155,21 @@ copyHeaders = do
   headers <- filter (".h" `isSuffixOf`) . lines
           <$> runWithResult "find souffle -type f"
   includes <- concatMapM parseIncludesInHeader headers
-  let baseNames = map toBaseName headers
+  let baseNames = Map.fromList $ map (\x -> (takeFileName x, x)) headers
   traverse copyHeader =<< computeRequiredIncludes includes baseNames
-  where toBaseName path = BaseName (takeFileName path) path
 
-computeRequiredIncludes :: [Includes] -> [BaseName] -> IO [FilePath]
+computeRequiredIncludes :: [Includes] -> Map FileName FilePath -> IO [FilePath]
 computeRequiredIncludes includes baseNames = do
+  renderIO Handle "/tmp/bla.dl" dlProgram
   requiredIncludes <- runSouffleInterpreted Handle dlProgram $ \case
     Nothing -> error "Failed to load Souffle program. Aborting."
     Just prog -> do
       Souffle.addFact prog $ TopLevelInclude "CompiledSouffle.h"
       Souffle.addFacts prog includes
-      Souffle.addFacts prog baseNames
       Souffle.run prog
       Souffle.getFacts prog
-  pure $ map (\(RequiredInclude include) -> include) requiredIncludes
+  pure $ map (\(RequiredInclude include) -> getFilePath include) requiredIncludes
+  where getFilePath include = fromJust $ Map.lookup include baseNames
 
 copyHeader :: FilePath -> IO FilePath
 copyHeader file = do
